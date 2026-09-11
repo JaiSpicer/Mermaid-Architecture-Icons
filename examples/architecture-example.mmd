@@ -1,0 +1,9 @@
+architecture-beta
+    group api(cloud)[Application]
+
+    service funcapp(azure:function-apps)[Function App] in api
+    service kv(azure:key-vaults)[Key Vault] in api
+    service xap(application:xap)[Xap] in api
+
+    funcapp:R -- L:kv
+    funcapp:B -- T:xap
