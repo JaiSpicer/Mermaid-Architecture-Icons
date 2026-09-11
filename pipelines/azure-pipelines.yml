@@ -1,0 +1,112 @@
+# UNTESTED TEMPLATE: this YAML has been validated by running the underlying
+# PowerShell scripts directly (build-icon-pack.ps1, update-azure-pack.ps1,
+# validate-icon-packs.ps1 all work as shown), but the pipeline itself has not
+# been run against a live Azure DevOps organization. Verify the agent image,
+# task versions, and any org-specific policies (approved task list, network
+# egress rules, service connection permissions) before relying on it.
+#
+# Builds and validates all Mermaid icon packs on every push/PR to main.
+#
+# Steps:
+#   1. Generate packs/<name>-icons.json for every pack folder under source/.
+#   2. Verify packs/azure-icons.json (the third-party Azure pack) is present.
+#   3. Validate all packs under packs/ for structural issues and name conflicts.
+#   4. Publish the generated packs as a build artifact.
+#   5. Publish a build summary log as a build artifact.
+#   6. Optionally, publish packs/*.json to Azure Blob Storage (disabled by
+#      default — see the `publishToBlobStorage` variable below). This is the
+#      recommended way to make packs reachable by Mermaid CLI's fetch() call
+#      from a network-restricted Azure DevOps environment where the Azure
+#      Repos raw item API isn't anonymously reachable or doesn't set CORS
+#      headers — see "Publishing to Azure Blob Storage" in
+#      azureDevOps/README.md. This stage is also an untested template: fill
+#      in the placeholders and verify the service connection's permissions
+#      before enabling it.
+
+trigger:
+  branches:
+    include:
+      - main
+
+pr:
+  branches:
+    include:
+      - main
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  summaryFile: '$(Build.ArtifactStagingDirectory)/build-summary.log'
+  # Set to 'true' and fill in the three values below to publish packs/*.json
+  # to Azure Blob Storage at the end of a successful run. Leave 'false' to
+  # skip it entirely (e.g. while only the build artifact is needed).
+  publishToBlobStorage: 'false'
+  storageAccountServiceConnection: '<azure-service-connection-name>'
+  storageAccountName: '<storage-account-name>'
+  storageContainerName: 'icon-packs'
+
+stages:
+  - stage: BuildAndValidate
+    displayName: 'Build and Validate Icon Packs'
+    jobs:
+      - job: IconPacks
+        displayName: 'Icon Pack Build & Validation'
+        steps:
+          - pwsh: |
+              New-Item -ItemType Directory -Path (Split-Path '$(summaryFile)') -Force | Out-Null
+            displayName: 'Prepare artifact staging directory'
+
+          - pwsh: |
+              $exitCode = 0
+              Get-ChildItem -Path 'source' -Directory | ForEach-Object {
+                  ./scripts/build-icon-pack.ps1 -PackName $_.Name *>&1 | Tee-Object -FilePath '$(summaryFile)' -Append
+                  if ($LASTEXITCODE -ne 0) { $exitCode = $LASTEXITCODE }
+              }
+              exit $exitCode
+            displayName: 'Generate icon packs from source/'
+
+          - pwsh: |
+              if (-not (Test-Path 'packs/azure-icons.json')) {
+                  "[ERROR] packs/azure-icons.json is missing. Run scripts/update-azure-pack.ps1 and commit the result." |
+                      Tee-Object -FilePath '$(summaryFile)' -Append
+                  exit 1
+              }
+              "[INFO] packs/azure-icons.json present" | Tee-Object -FilePath '$(summaryFile)' -Append
+            displayName: 'Verify azure-icons.json'
+
+          - pwsh: |
+              ./scripts/validate-icon-packs.ps1 *>&1 | Tee-Object -FilePath '$(summaryFile)' -Append
+              exit $LASTEXITCODE
+            displayName: 'Validate all icon packs'
+
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish icon packs'
+            condition: succeededOrFailed()
+            inputs:
+              PathtoPublish: 'packs'
+              ArtifactName: 'icon-packs'
+
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish build summary'
+            condition: succeededOrFailed()
+            inputs:
+              PathtoPublish: '$(summaryFile)'
+              ArtifactName: 'build-summary'
+
+          # UNTESTED TEMPLATE STEP. Disabled by default (publishToBlobStorage
+          # is 'false' above). Requires an ARM service connection with
+          # Storage Blob Data Contributor (or equivalent) on the target
+          # storage account, and the storage account's CORS rules to allow
+          # GET from '*' (headless Chrome's fetch() runs from a null/file:
+          # origin at render time, so an origin-specific rule won't match —
+          # see azureDevOps/README.md).
+          - task: AzureFileCopy@6
+            displayName: 'Publish icon packs to Azure Blob Storage'
+            condition: and(succeeded(), eq(variables.publishToBlobStorage, 'true'))
+            inputs:
+              SourcePath: 'packs'
+              azureSubscription: '$(storageAccountServiceConnection)'
+              Destination: AzureBlob
+              storage: '$(storageAccountName)'
+              ContainerName: '$(storageContainerName)'
